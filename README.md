@@ -1,0 +1,2 @@
+# haskell-General
+Общие задачи
