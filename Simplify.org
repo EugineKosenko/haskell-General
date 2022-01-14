@@ -1,0 +1,309 @@
+#+title: Упрощение форматированного вывода исходного кода Haskell
+
+Пакет =TH= (/Template Haskell/) содержит возможности форматированного вывода конструкций типа ~Exp~ с
+помощью функции ~Ppr.pprint~.
+
+* Постановка задачи
+
+Функция ~pprint~ позволяет красиво распечатать любое выражение, полученное в брикетах =Template Haskell=.
+
+#+begin_src haskell :results none
+  :set -XTemplateHaskell
+  :set -package template-haskell
+  :m +Language.Haskell.TH
+  :m +Language.Haskell.TH.Syntax
+
+  e <- runQ [| a + b |]
+#+end_src
+
+Если теперь выполнить ~pprint e~, получим:
+
+src_haskell{pprint e} {{{results(=a GHC.Num.+ b=)}}}
+
+Тут, однако, сложность в том, что все глобальные переменные показываются с полным путем контекста. Это
+усложняет чтение выражения, так как простой арифметический знак ~+~ превращаеется в полное имя. Это не
+всегда нужно. Проще всего обойти это простой заменой всех имен на неквалифицированные. При этом
+достаточно заменить конструктор ~NameG~ на ~NameS~. Для начала посмотрим структуру выражения с помощью
+~show e~:
+
+src_haskell{show e} {{{results(=InfixE (Just (UnboundVarE a)) (VarE GHC.Num.+) (Just (UnboundVarE b))=)}}}
+
+Определим функцию ~simplify~, которая в этом выражении заменяет имя.
+
+#+begin_src haskell :results none
+  :{
+     simplify :: Exp -> Exp
+     simplify (InfixE (Just e1) op (Just e2)) = InfixE (Just $ simplify e1) (simplify op) (Just $ simplify e2)
+     simplify (VarE (Name occ _)) = VarE (Name occ NameS)
+     simplify e = e
+  :}
+#+end_src
+
+#+begin_src haskell :results none
+  let a = 1
+  e <- runQ [| a + b |]  
+#+end_src
+
+#+begin_src haskell
+  pprint $ simplify e
+#+end_src
+
+#+RESULTS:
+: a + b
+
+* Обобщение выражений
+:PROPERTIES:
+:ID:       764d8b3a-6cd1-48c9-9a66-af233b14f44e
+:END:
+
+Построенная функция ~simplify~ в целом подсказывает контекст решения, но она не покрывает всех возможных
+вариантов. Воспользуемся обобщенным решением, описанным в [[file:~/creative/habr/metaprog/generic/generic.org][generic.org]].
+
+#+begin_src haskell :noweb no-export :mkdirp yes :tangle src/Simplify.hs
+  {-# LANGUAGE
+    <<Simplify:Расширения>>
+  #-}
+
+  module Simplify(
+    <<Simplify:Экспорт>>
+    ) where
+
+    <<Simplify:Импорт>>
+
+    <<Simplify:Определения>>
+#+end_src
+
+Определим ~Simplified~ как класс типов, допускающих упрощение входящих в него выражений.
+
+#+begin_src haskell :noweb-sep ",\n" :noweb-ref Simplify:Расширения :exports none
+  DefaultSignatures,
+  FlexibleContexts
+#+end_src
+
+#+begin_src haskell :noweb-sep ",\n" :noweb-ref Simplify:Экспорт :exports none
+  simplify
+#+end_src
+
+#+begin_src haskell :noweb-ref Simplify:Импорт :exports none
+  import GHC.Generics(Generic, Rep, from, to)
+#+end_src
+
+#+begin_src haskell :noweb-ref Simplify:Определения
+  class Simplified e where
+    simplify :: e -> e
+    default simplify :: (Generic e, GSimplified (Rep e)) => e -> e
+    simplify = to . gsimplify . from
+#+end_src
+
+В самом базовом варианте нам необходимо определить упрощение имени ~Name~, при котором все имена
+заменяются на локальное имя ~occ~ (/Occurence Name/).
+
+#+begin_src haskell :noweb-ref Simplify:Импорт
+  import Language.Haskell.TH.Syntax(Name(Name), NameFlavour(NameS))
+#+end_src
+
+#+begin_src haskell :noweb-ref Simplify:Определения
+  instance Simplified Name where
+    simplify (Name occ _) = Name occ NameS
+#+end_src
+
+Определим упрощение на обобщенном классе ~GSimplified~.
+
+#+begin_src haskell :noweb-ref Simplify:Определения
+  class GSimplified f where
+    gsimplify :: f r -> f r
+#+end_src
+
+** Преобразование представления типа в целом.
+
+#+begin_src haskell :noweb-ref Simplify:Импорт
+  import GHC.Generics(M1(M1), D1)
+#+end_src
+
+#+begin_src haskell :noweb-ref Simplify:Определения
+  instance (GSimplified a) => GSimplified (D1 d a) where
+    gsimplify (M1 a) = M1 $ gsimplify a
+#+end_src
+
+** Преобразование списка конструкторов.
+
+#+begin_src haskell :noweb-sep ",\n" :noweb-ref Simplify:Расширения
+  TypeOperators
+#+end_src
+
+#+begin_src haskell :noweb-ref Simplify:Импорт
+  import GHC.Generics((:+:)(L1, R1))
+#+end_src
+
+#+begin_src haskell :noweb-ref Simplify:Определения
+  instance (GSimplified a, GSimplified b) => GSimplified (a :+: b) where
+      gsimplify (L1 x) = L1 $ gsimplify x
+      gsimplify (R1 x) = R1 $ gsimplify x
+#+end_src
+
+** Преобразование конкретного конструктора
+
+#+begin_src haskell :noweb-ref Simplify:Импорт
+  import GHC.Generics(C1)
+#+end_src
+
+#+begin_src haskell :noweb-ref Simplify:Определения
+  instance (GSimplified a) => GSimplified (C1 c a) where
+      gsimplify (M1 x) = M1 $ gsimplify x
+#+end_src
+
+** Преобразование списка полей
+
+#+begin_src haskell :noweb-ref Simplify:Импорт
+  import GHC.Generics((:*:)((:*:)))
+
+#+end_src
+
+#+BEGIN_SRC haskell :noweb-ref Simplify:Определения
+  instance (GSimplified a, GSimplified b) => GSimplified (a :*: b) where
+      gsimplify (a :*: b) = gsimplify a :*: gsimplify b
+#+END_SRC
+
+** Преобразование поля
+
+#+begin_src haskell :noweb-ref Simplify:Импорт
+  import GHC.Generics(S1, K1(K1))
+#+end_src
+
+#+begin_src haskell :noweb-ref Simplify:Определения
+  instance (GSimplified a) => GSimplified (S1 e a) where
+      gsimplify (M1 x) = M1 $ gsimplify x
+#+end_src
+
+#+begin_src haskell :noweb-sep ",\n" :noweb-ref Simplify:Расширения
+  UndecidableInstances
+#+end_src
+
+#+BEGIN_SRC haskell :noweb-ref Simplify:Определения
+  instance (Simplified a) => GSimplified (K1 i a) where
+      gsimplify (K1 f) = K1 $ simplify f
+#+END_SRC
+
+** Преобразование конструктора без полей
+
+#+begin_src haskell :noweb-ref Simplify:Импорт
+  import GHC.Generics(U1(U1))
+#+end_src
+
+#+BEGIN_SRC haskell :noweb-ref Simplify:Определения
+  instance GSimplified U1 where
+      gsimplify U1 = U1
+#+END_SRC
+
+** Определение экземпляров
+
+Определим, например, тип ~Exp~, как тип самого верхнего уровня, как /упростимый/.
+
+#+begin_src haskell :noweb-sep ",\n" :noweb-ref Simplify:Расширения
+  FlexibleInstances
+#+end_src
+
+#+begin_src haskell :noweb-ref Simplify:Импорт
+  import Language.Haskell.TH.Syntax
+#+end_src
+
+#+begin_src haskell :noweb-ref Simplify:Определения
+  instance Simplified t => Simplified (Maybe t)
+  instance Simplified t => Simplified [t]
+  instance (Simplified t1, Simplified t2) => Simplified (t1, t2)
+  instance (Simplified t1, Simplified t2, Simplified t3) => Simplified (t1, t2, t3)
+  instance Simplified Exp
+  instance Simplified Guard
+  instance Simplified Stmt
+  instance Simplified Dec
+  instance Simplified Clause
+  instance Simplified Pat
+  instance Simplified Lit
+  instance Simplified Type
+  instance Simplified TyVarBndr
+  instance Simplified TyLit
+  instance Simplified Body
+  instance Simplified Con
+  instance Simplified Bang
+  instance Simplified SourceUnpackedness
+  instance Simplified SourceStrictness
+  instance Simplified DerivClause
+  instance Simplified DerivStrategy
+  instance Simplified FunDep
+  instance Simplified Overlap
+  instance Simplified Foreign
+  instance Simplified Callconv
+  instance Simplified Safety
+  instance Simplified Fixity
+  instance Simplified FixityDirection
+  instance Simplified Pragma
+  instance Simplified Inline
+  instance Simplified RuleMatch
+  instance Simplified Phases
+  instance Simplified RuleBndr
+  instance Simplified AnnTarget
+  instance Simplified TySynEqn
+  instance Simplified TypeFamilyHead
+  instance Simplified FamilyResultSig
+  instance Simplified InjectivityAnn
+  instance Simplified Role
+  instance Simplified Match
+  instance Simplified PatSynArgs
+  instance Simplified PatSynDir
+  instance Simplified Range
+#+end_src
+
+#+begin_src haskell :noweb-ref Simplify:Импорт
+  import Data.Ratio(Ratio)
+  import Data.Char(Char)
+  import Data.Word(Word8)
+#+end_src
+
+#+begin_src haskell :noweb-ref Simplify:Определения
+  instance Simplified Int where
+    simplify = id
+
+  instance Simplified Word8 where
+    simplify = id
+
+  instance Simplified Char where
+    simplify = id
+
+  instance Simplified Integer where
+    simplify = id
+
+  instance Simplified (Ratio Integer) where
+    simplify = id
+
+  instance Simplified Bytes where
+    simplify = id
+#+end_src
+
+* COMMENT Определение экземпляров через шаблоны
+
+Функция ~lookupType~ находи тип по его имени
+
+#+begin_src haskell :noweb-ref Simplify:Simplified:Импорт
+  import Data.Maybe(fromJust)
+#+end_src
+
+#+begin_src haskell :noweb-ref Simplify:Simplified:Определения
+  lookupType :: String -> Q Type
+  lookupType n = do
+    n <- lookupName True n
+    return (ConT $ fromJust n)
+#+end_src
+
+Функция ~mkSimplified~ создает по шаблону описание экземпляра класса ~Simplified~.
+
+#+begin_src haskell :noweb-ref Simplify:Simplified:Определения
+  mkSimplified :: String -> Q [Dec]
+  mkSimplified n = do
+    i <- lookupType "Simplified"
+    t <- lookupType n
+    return [InstanceD Nothing [] (AppT i t) []]
+#+end_src
+
+#+begin_src haskell :noweb-ref Simplify:Simplified:Определения
+  $(mapM mkSimplified ["Exp"])
+#+end_src
